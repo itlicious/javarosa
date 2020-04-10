@@ -16,31 +16,10 @@
 
 package org.javarosa.core.test;
 
-import org.javarosa.core.model.FormDef;
-import org.javarosa.core.model.FormIndex;
-import org.javarosa.core.model.QuestionDef;
-import org.javarosa.core.model.SelectChoice;
-import org.javarosa.core.model.data.IAnswerData;
-import org.javarosa.core.model.data.MultipleItemsData;
-import org.javarosa.core.model.data.StringData;
-import org.javarosa.core.model.data.helper.Selection;
-import org.javarosa.core.model.instance.InstanceInitializationFactory;
-import org.javarosa.core.model.instance.TreeElement;
-import org.javarosa.core.model.instance.TreeReference;
-import org.javarosa.form.api.FormEntryController;
-import org.javarosa.form.api.FormEntryModel;
-import org.javarosa.form.api.FormEntryPrompt;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Objects;
-import java.util.Optional;
-import java.util.stream.Collectors;
-
+import static java.nio.file.Files.createTempFile;
+import static java.nio.file.Files.delete;
+import static java.nio.file.Files.newInputStream;
+import static java.nio.file.Files.newOutputStream;
 import static org.javarosa.core.model.instance.TreeReference.CONTEXT_ABSOLUTE;
 import static org.javarosa.core.model.instance.TreeReference.INDEX_TEMPLATE;
 import static org.javarosa.core.model.instance.TreeReference.REF_ABSOLUTE;
@@ -53,6 +32,42 @@ import static org.javarosa.form.api.FormEntryController.EVENT_QUESTION;
 import static org.javarosa.form.api.FormEntryController.EVENT_REPEAT;
 import static org.javarosa.form.api.FormEntryController.EVENT_REPEAT_JUNCTURE;
 import static org.javarosa.test.utils.ResourcePathHelper.r;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import org.javarosa.core.model.CoreModelModule;
+import org.javarosa.core.model.FormDef;
+import org.javarosa.core.model.FormIndex;
+import org.javarosa.core.model.IFormElement;
+import org.javarosa.core.model.QuestionDef;
+import org.javarosa.core.model.SelectChoice;
+import org.javarosa.core.model.data.IAnswerData;
+import org.javarosa.core.model.data.IntegerData;
+import org.javarosa.core.model.data.MultipleItemsData;
+import org.javarosa.core.model.data.StringData;
+import org.javarosa.core.model.data.helper.Selection;
+import org.javarosa.core.model.instance.InstanceInitializationFactory;
+import org.javarosa.core.model.instance.TreeElement;
+import org.javarosa.core.model.instance.TreeReference;
+import org.javarosa.core.services.PrototypeManager;
+import org.javarosa.core.util.JavaRosaCoreModule;
+import org.javarosa.core.util.externalizable.DeserializationException;
+import org.javarosa.form.api.FormEntryController;
+import org.javarosa.form.api.FormEntryModel;
+import org.javarosa.form.api.FormEntryPrompt;
+import org.javarosa.model.xform.XFormsModule;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * <div style="border: 1px 1px 1px 1px; background-color: #556B2F; color: white; padding: 20px">
@@ -106,6 +121,7 @@ public class Scenario {
 
     public static Scenario init(Path formFile) {
         // TODO explain why this sequence of calls
+        new XFormsModule().registerModule();
         FormParseInit fpi = new FormParseInit(formFile);
         FormDef formDef = fpi.getFormDef();
         formDef.initialize(true, new InstanceInitializationFactory());
@@ -150,6 +166,17 @@ public class Scenario {
     }
 
     /**
+     * Sets the value of the element located at the given xPath in the main instance to the given integer value.
+     *
+     * @see #answer(String, String)
+     */
+    public void answer(String xPath, int value) {
+        createMissingRepeats(xPath);
+        TreeElement element = Objects.requireNonNull(resolve(xPath));
+        formDef.setValue(new IntegerData(value), element.getRef(), true);
+    }
+
+    /**
      * Jumps to the first question with the given name.
      */
     public Scenario jumpToFirst(String name) {
@@ -160,9 +187,8 @@ public class Scenario {
     /**
      * Answers the current question.
      */
-    public Scenario answer(String value) {
-        formEntryController.answerQuestion(formEntryController.getModel().getFormIndex(), new StringData(value), true);
-        return this;
+    public AnswerResult answer(String value) {
+        return AnswerResult.from(formEntryController.answerQuestion(formEntryController.getModel().getFormIndex(), new StringData(value), true));
     }
 
     /**
@@ -170,7 +196,19 @@ public class Scenario {
      * </ul>
      */
     public void next() {
-        formEntryController.stepToNextEvent();
+        int i = formEntryController.stepToNextEvent();
+        String jumpResult = decodeJumpResult(i);
+        FormIndex formIndex = formEntryController.getModel().getFormIndex();
+        IFormElement child = formDef.getChild(formIndex);
+        String labelInnerText = Optional.ofNullable(child.getLabelInnerText()).map(s -> " " + s).orElse("");
+        String textId = Optional.ofNullable(child.getTextID()).map(s -> " itext:" + s).orElse("");
+        String reference = "";
+        try {
+            reference = Optional.ofNullable(child.getBind()).map(idr -> (TreeReference) idr.getReference()).map(Object::toString).map(s -> " ref:" + s).orElse("");
+        } catch (RuntimeException e) {
+            // Do nothing. Probably "method not implemented" in FormDef.getBind()
+        }
+        log.info("Jump to {}{}{}{}", jumpResult, labelInnerText, textId, reference);
     }
 
     /**
@@ -264,7 +302,11 @@ public class Scenario {
         formDef.initialize(true, new InstanceInitializationFactory());
     }
 
-    private void createMissingRepeats(String xPath) {
+    public void setLanguage(String language) {
+        formEntryController.setLanguage(language);
+    }
+
+    public void createMissingRepeats(String xPath) {
         // We will be looking to the parts in the xPath from left to right.
         // xPath.substring(1) makes the first "/" char go away, giving us an xPath relative to the root
         List<String> parts = Arrays.asList(xPath.substring(1).split("/"));
@@ -472,5 +514,43 @@ public class Scenario {
                 return "Repeat Juncture";
         }
         return "Unknown";
+    }
+
+    public enum AnswerResult {
+        OK(0), REQUIRED_BUT_EMPTY(1), CONSTRAINT_VIOLATED(2);
+
+        private final int jrCode;
+
+        AnswerResult(int jrCode) {
+            this.jrCode = jrCode;
+        }
+
+        public static AnswerResult from(int jrCode) {
+            return Stream.of(values())
+                .filter(v -> v.jrCode == jrCode)
+                .findFirst()
+                .orElseThrow(RuntimeException::new);
+        }
+    }
+
+    public Scenario serializeAndDeserializeForm() throws IOException, DeserializationException {
+        // Initialize serialization
+        PrototypeManager.registerPrototypes(JavaRosaCoreModule.classNames);
+        PrototypeManager.registerPrototypes(CoreModelModule.classNames);
+        new XFormsModule().registerModule();
+
+        // Serialize form in a temp file
+        Path tempFile = createTempFile("javarosa", "test");
+        formDef.writeExternal(new DataOutputStream(newOutputStream(tempFile)));
+
+        // Create an empty FormDef and deserialize the form into it
+        FormDef deserializedFormDef = new FormDef();
+        deserializedFormDef.readExternal(
+            new DataInputStream(newInputStream(tempFile)),
+            PrototypeManager.getDefault()
+        );
+
+        delete(tempFile);
+        return new Scenario(deserializedFormDef, new FormEntryController(new FormEntryModel(deserializedFormDef)));
     }
 }
