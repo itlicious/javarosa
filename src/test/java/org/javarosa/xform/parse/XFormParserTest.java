@@ -1,5 +1,35 @@
 package org.javarosa.xform.parse;
 
+import static java.nio.file.Files.copy;
+import static java.nio.file.Files.readAllBytes;
+import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.core.Is.is;
+import static org.hamcrest.core.IsInstanceOf.instanceOf;
+import static org.javarosa.core.model.Constants.CONTROL_RANGE;
+import static org.javarosa.core.model.Constants.CONTROL_RANK;
+import static org.javarosa.core.test.AnswerDataMatchers.intAnswer;
+import static org.javarosa.core.util.BindBuilderXFormsElement.bind;
+import static org.javarosa.core.util.XFormsElement.body;
+import static org.javarosa.core.util.XFormsElement.head;
+import static org.javarosa.core.util.XFormsElement.html;
+import static org.javarosa.core.util.XFormsElement.input;
+import static org.javarosa.core.util.XFormsElement.mainInstance;
+import static org.javarosa.core.util.XFormsElement.model;
+import static org.javarosa.core.util.XFormsElement.t;
+import static org.javarosa.test.utils.ResourcePathHelper.r;
+import static org.javarosa.xform.parse.FormParserHelper.deserializeAndCleanUpSerializedForm;
+import static org.javarosa.xform.parse.FormParserHelper.getSerializedFormPath;
+import static org.javarosa.xform.parse.FormParserHelper.parse;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
 import org.javarosa.core.model.FormDef;
 import org.javarosa.core.model.GroupDef;
 import org.javarosa.core.model.IDataReference;
@@ -7,7 +37,7 @@ import org.javarosa.core.model.IFormElement;
 import org.javarosa.core.model.QuestionDef;
 import org.javarosa.core.model.RangeQuestion;
 import org.javarosa.core.model.SubmissionProfile;
-import org.javarosa.core.model.actions.Action;
+import org.javarosa.core.model.actions.Actions;
 import org.javarosa.core.model.data.StringData;
 import org.javarosa.core.model.instance.AbstractTreeElement;
 import org.javarosa.core.model.instance.DataInstance;
@@ -17,38 +47,19 @@ import org.javarosa.core.model.instance.TreeElement;
 import org.javarosa.core.model.instance.TreeReference;
 import org.javarosa.core.reference.ReferenceManagerTestUtils;
 import org.javarosa.core.services.transport.payload.ByteArrayPayload;
+import org.javarosa.core.test.Scenario;
 import org.javarosa.core.util.externalizable.DeserializationException;
 import org.javarosa.model.xform.XFormSerializingVisitor;
 import org.javarosa.model.xform.XPathReference;
 import org.javarosa.xpath.parser.XPathSyntaxException;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
 import org.kxml2.kdom.Element;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.List;
-
-import static java.nio.file.Files.copy;
-import static java.nio.file.Files.readAllBytes;
-import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.core.Is.is;
-import static org.hamcrest.core.IsInstanceOf.instanceOf;
-import static org.javarosa.core.model.Constants.CONTROL_RANGE;
-import static org.javarosa.core.model.Constants.CONTROL_RANK;
-import static org.javarosa.test.utils.ResourcePathHelper.r;
-import static org.javarosa.xform.parse.FormParserHelper.deserializeAndCleanUpSerializedForm;
-import static org.javarosa.xform.parse.FormParserHelper.getSerializedFormPath;
-import static org.javarosa.xform.parse.FormParserHelper.parse;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
 
 public class XFormParserTest {
     private static final Logger logger = LoggerFactory.getLogger(XFormParserTest.class);
@@ -98,7 +109,32 @@ public class XFormParserTest {
         assertEquals(3, formDef.getChildren().size());
         assertEquals("What is your first name?", formDef.getChild(0).getLabelInnerText());
     }
+    
+    @Test
+    public void spacesBetweenOutputs_areRespected() throws IOException {
+        Scenario scenario = Scenario.init("spaces-outputs", html(
+            head(
+                model(
+                    mainInstance(t("data id=\"spaces-outputs\"",
+                        t("first_name"),
+                        t("last_name"),
+                        t("question")
+                    )),
+                    bind("/data/question").type("string")
+                )),
+            body(
+                input("/data/question",
+                        t("label", "Full name: <output value=\" ../first_name \"/>\u00A0<output value=\" ../last_name \"/>"))
+            )
+        ));
 
+        scenario.next();
+        String innerText = scenario.getQuestionAtIndex().getLabelInnerText();
+        char nbsp = 0x00A0;
+        String expected = "Full name: ${0}" + nbsp + "${1}";
+        assertEquals(expected, innerText);
+    }
+    
     @Test
     public void parsesSecondaryInstanceForm() throws IOException {
         FormDef formDef = parse(SECONDARY_INSTANCE_XML);
@@ -154,7 +190,7 @@ public class XFormParserTest {
 
     /**
      * ensure serializing and deserializing a range form is done without errors
-     * see https://github.com/opendatakit/javarosa/issues/245 why this is needed
+     * see https://github.com/getodk/javarosa/issues/245 why this is needed
      */
     @Test
     public void rangeFormSavesAndRestores() throws IOException, DeserializationException {
@@ -188,6 +224,24 @@ public class XFormParserTest {
     @Test(expected = XFormParseException.class)
     public void throwsParseExceptionOnBadRangeForm() throws IOException {
         parse(r("bad-range-form.xml"));
+    }
+    @Rule
+    public ExpectedException exceptionRule = ExpectedException.none();
+
+    @Test
+    public void throwsExceptionOnEmptySelect() throws IOException {
+        exceptionRule.expect(XFormParseException.class);
+        exceptionRule.expectMessage("Select question 'First' has no choices");
+
+        Path formName = r("internal_empty_select.xml");
+        FormDef formDef = parse(formName);
+    }
+
+    @Test
+    public void formWithCountNonEmptyFunc_ShouldNotThrowException() throws IOException {
+        Scenario scenario = Scenario.init("countNonEmptyForm.xml");
+        assertThat(scenario.answerOf("/test/count_value"), is(intAnswer(4)));
+        assertThat(scenario.answerOf("/test/count_non_empty_value"), is(intAnswer(2)));
     }
 
     @Test
@@ -330,13 +384,13 @@ public class XFormParserTest {
         // Given & When
         FormDef formDef = parse(r("form-with-setvalue-action.xml"));
 
-        // dispatch 'odk-instance-first-load' event (Action.EVENT_ODK_INSTANCE_FIRST_LOAD)
+        // dispatch 'odk-instance-first-load' event (Actions.EVENT_ODK_INSTANCE_FIRST_LOAD)
         formDef.initialize(true, new InstanceInitializationFactory());
 
         // Then
         assertEquals(formDef.getTitle(), "SetValue action");
         assertNoParseErrors(formDef);
-        assertEquals(1, formDef.getActionController().getListenersForEvent(Action.EVENT_ODK_INSTANCE_FIRST_LOAD).size());
+        assertEquals(1, formDef.getActionController().getListenersForEvent(Actions.EVENT_ODK_INSTANCE_FIRST_LOAD).size());
 
         TreeElement textNode =
             formDef.getMainInstance().getRoot().getChildrenWithName("text").get(0);
@@ -403,6 +457,14 @@ public class XFormParserTest {
         assertThat(g3Element.getBind(), is(g3AbsRef));
     }
 
+    @Test
+    public void testSetValueWithStrings() throws IOException {
+        
+        Scenario scenario = Scenario.init("default_test.xml");
+        assertEquals("string-value", scenario.getAnswerNode("/data/string_val").getValue().getValue().toString());
+        assertEquals("inline-value", scenario.getAnswerNode("/data/inline_val").getValue().getValue().toString());
+    }
+    
     private TreeElement findDepthFirst(TreeElement parent, String name) {
         int len = parent.getNumChildren();
         for (int i = 0; i < len; ++i) {
